@@ -5,6 +5,9 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from contextlib import redirect_stdout
 import io
+import os
+import re
+import subprocess
 import sys
 import unittest
 import zipfile
@@ -1226,6 +1229,345 @@ class Md2WordRegressionTest(unittest.TestCase):
                     f"{name} 空列表不得触发标题分页",
                 )
 
+
+class ConsoleOutputRegressionTest(unittest.TestCase):
+    """旧 Windows 代码页（GBK）下状态图标不得中断转换（7597b03 历史修复的回归）。"""
+
+    def test_gbk_console_output_does_not_abort_conversion_helpers(self):
+        script = f"""
+from pathlib import Path
+from tempfile import TemporaryDirectory
+import sys
+sys.path.insert(0, {str(HERE)!r})
+from docx import Document
+from formatter import convert_quotes_to_chinese
+from footnote_handler import _inject_footnotes_into_docx
+
+convert_quotes_to_chinese("标注'需律师现场确认'")
+with TemporaryDirectory() as temp:
+    path = Path(temp) / "footnotes.docx"
+    Document().save(path)
+    _inject_footnotes_into_docx(str(path), [(1, "脚注")])
+"""
+        env = os.environ.copy()
+        env["PYTHONIOENCODING"] = "gbk:strict"
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            capture_output=True,
+            env=env,
+            check=False,
+        )
+        self.assertEqual(
+            result.returncode,
+            0,
+            result.stderr.decode("gbk", errors="replace"),
+        )
+        self.assertIn(b"\\u2705", result.stdout)
+
+
+class LetterheadRegressionTest(unittest.TestCase):
+    """页眉页脚模板（letterhead）：只取模板页眉页脚，正文排版保持预设。"""
+
+    SKILL_ROOT = HERE.parent
+    LETTERHEAD = SKILL_ROOT / "assets" / "letterhead" / "斯可睿抬头.docx"
+    SAMPLE_MD = "# 测试标题\n\n正文第一段，含“引号”。\n\n## 一、小节\n\n- 事项一\n- 事项二\n"
+
+    def _write_md(self, tmp, text=None):
+        source = Path(tmp) / "input.md"
+        source.write_text(text or self.SAMPLE_MD, encoding="utf-8")
+        return source
+
+    def _convert(self, source, output, config, **kwargs):
+        stdout = io.StringIO()
+        with redirect_stdout(stdout):
+            md2word.set_config(config)
+            md2word.create_word_document(
+                str(source), str(output), config=config, **kwargs
+            )
+        return stdout.getvalue()
+
+    @staticmethod
+    def _sectpr_refs(archive):
+        """解析文档 sectPr 的页眉页脚引用 -> {(kind, type): 部件名}。"""
+        document_xml = archive.read("word/document.xml").decode("utf-8")
+        rels_xml = archive.read("word/_rels/document.xml.rels").decode("utf-8")
+        sect = re.search(r"<w:sectPr.*?</w:sectPr>", document_xml, re.S).group(0)
+        refs = {}
+        for match in re.finditer(r"<w:(header|footer)Reference[^>]*/>", sect):
+            element = match.group(0)
+            kind = match.group(1)
+            typ = re.search(r'w:type="(\w+)"', element).group(1)
+            rid = re.search(r'r:id="(\w+)"', element).group(1)
+            target = re.search(
+                r'Id="%s"[^>]*Target="([^"]+)"' % rid, rels_xml
+            ).group(1)
+            refs[(kind, typ)] = "word/" + target
+        return document_xml, refs
+
+    def test_legal_preset_enables_letterhead_by_default(self):
+        config = md2word.get_preset("legal")
+        self.assertTrue(config.get("letterhead.enabled"))
+        self.assertEqual(
+            config.get("letterhead.template"),
+            "assets/letterhead/斯可睿抬头.docx",
+        )
+        resolved = md2word.resolve_letterhead_path(config.get("letterhead.template"))
+        self.assertTrue(Path(resolved).exists())
+        self.assertTrue(self.LETTERHEAD.exists())
+
+    def test_letterhead_flag_resolution(self):
+        config = md2word.get_preset("legal")
+        args = md2word.argparse.Namespace(letterhead=None, no_letterhead=False)
+        self.assertTrue(Path(md2word.resolve_letterhead_file(config, args)).exists())
+        args = md2word.argparse.Namespace(letterhead=None, no_letterhead=True)
+        self.assertIsNone(md2word.resolve_letterhead_file(config, args))
+        args = md2word.argparse.Namespace(letterhead="__default__", no_letterhead=False)
+        self.assertTrue(Path(md2word.resolve_letterhead_file(config, args)).exists())
+        self.assertIsNone(md2word.resolve_letterhead_path("none"))
+
+    @staticmethod
+    def _part_media(data, part):
+        """按部件 rels 收集其引用的内部文件字节集合（媒体一致性校验用）。"""
+        import letterhead as letterhead_module
+
+        rels_name = "word/_rels/%s.rels" % Path(part).name
+        if rels_name not in data:
+            return set()
+        rels_xml = data[rels_name].decode("utf-8")
+        media = set()
+        for rel in re.finditer(r"<Relationship\b[^>]*/>", rels_xml):
+            element = rel.group(0)
+            if 'TargetMode="External"' in element:
+                continue
+            target = re.search(r'Target="([^"]+)"', element).group(1)
+            media.add(data[letterhead_module._resolve_part(part, target)])
+        return media
+
+    def _template_and_output_refs(self, output):
+        """解析模板与产物的 {kind:type -> 部件名} 映射（与实现共用解析逻辑）。"""
+        import letterhead as letterhead_module
+
+        with zipfile.ZipFile(self.LETTERHEAD) as template, zipfile.ZipFile(output) as archive:
+            tpl_data = {name: template.read(name) for name in template.namelist()}
+            out_data = {name: archive.read(name) for name in archive.namelist()}
+        tpl_sect = letterhead_module._body_sectpr(tpl_data["word/document.xml"].decode("utf-8"))
+        tpl_refs = letterhead_module._sectpr_refs(tpl_sect, letterhead_module._doc_rels(tpl_data))
+        out_sect = re.search(
+            r"<w:sectPr.*?</w:sectPr>",
+            out_data["word/document.xml"].decode("utf-8"),
+            re.S,
+        ).group(0)
+        out_refs = letterhead_module._sectpr_refs(out_sect, letterhead_module._doc_rels(out_data))
+        return tpl_data, out_data, tpl_refs, out_refs
+
+    def test_letterhead_copies_first_and_default_header_footer(self):
+        config = md2word.get_preset("legal")
+        with TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            source = self._write_md(tmp)
+            output = tmp / "out.docx"
+            self._convert(source, output, config, letterhead_file=str(self.LETTERHEAD))
+
+            tpl_data, out_data, tpl_refs, out_refs = self._template_and_output_refs(output)
+            document_xml = out_data["word/document.xml"].decode("utf-8")
+            self.assertIn("<w:titlePg", document_xml)
+
+            # 首页与后续页必须按类型映射到模板对应部件（部件名可能不同），且逐字节一致
+            for key in (
+                "header:first",
+                "header:default",
+                "footer:first",
+                "footer:default",
+            ):
+                self.assertIn(key, tpl_refs, f"模板缺少 {key} 页眉页脚")
+                self.assertIn(key, out_refs, f"产物缺少 {key} 页眉页脚")
+                self.assertEqual(
+                    out_data[out_refs[key]],
+                    tpl_data[tpl_refs[key]],
+                    f"{key} 部件应与模板逐字节一致（{tpl_refs[key]} -> {out_refs[key]}）",
+                )
+                self.assertEqual(
+                    self._part_media(out_data, out_refs[key]),
+                    self._part_media(tpl_data, tpl_refs[key]),
+                    f"{key} 引用的媒体应与模板一致",
+                )
+
+            first_footer = "".join(
+                re.findall(r"<w:t[^>]*>([^<]*)</w:t>", out_data[out_refs["footer:first"]].decode("utf-8"))
+            )
+            default_footer = "".join(
+                re.findall(r"<w:t[^>]*>([^<]*)</w:t>", out_data[out_refs["footer:default"]].decode("utf-8"))
+            )
+            self.assertIn("地址：", first_footer)
+            self.assertIn("地址：", default_footer)
+            self.assertIn("PAGE", out_data[out_refs["footer:default"]].decode("utf-8"))
+            self.assertIn("NUMPAGES", out_data[out_refs["footer:default"]].decode("utf-8"))
+
+            styles = out_data["word/styles.xml"].decode("utf-8")
+            for style_id in ("a5", "a7", "a9"):
+                self.assertIn('w:styleId="%s"' % style_id, styles)
+            # 页眉页脚段落样式显式写死单倍行距/零段后距：目标 docDefaults 的间距不得漏进来撑高页脚
+            for style_id in ("a5", "a7"):
+                style = re.search(
+                    r'<w:style [^>]*w:styleId="%s".*?</w:style>' % style_id, styles, re.S
+                ).group(0)
+                self.assertIn('<w:spacing w:after="0" w:line="240" w:lineRule="auto"/>', style)
+                if "<w:jc" in style:
+                    self.assertLess(style.index("<w:spacing"), style.index("<w:jc"))
+            normal = re.search(
+                r'<w:style [^>]*w:styleId="Normal".*?</w:style>', styles, re.S
+            ).group(0)
+            self.assertIn('w:eastAsia="仿宋"', normal)
+            self.assertNotIn("宋体-简", normal)
+            self.assertEqual(styles.count('w:default="1"'), 4)
+
+    def test_letterhead_handles_template_with_offset_part_names(self):
+        """模板部件名与目标不同名（如 header3/footer3）时也必须按类型正确映射。"""
+        config = md2word.get_preset("legal")
+        with TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            template = tmp / "offset-template.docx"
+
+            template_doc = Document()
+            section = template_doc.sections[0]
+            section.different_first_page_header_footer = True
+            for hf in (
+                section.header,
+                section.first_page_header,
+                section.footer,
+                section.first_page_footer,
+            ):
+                hf.is_linked_to_previous = False
+            section.header.paragraphs[0].text = "DEFAULT HEADER"
+            section.first_page_header.paragraphs[0].text = "FIRST HEADER"
+            section.footer.paragraphs[0].text = "DEFAULT FOOTER"
+            section.first_page_footer.paragraphs[0].text = "FIRST FOOTER"
+            template_doc.save(template)
+
+            # 把部件名整体偏移（header1->header7, header2->header9 ...），模拟用户模板的命名
+            with zipfile.ZipFile(template) as archive:
+                entries = {name: archive.read(name) for name in archive.namelist()}
+            sect = re.search(
+                r"<w:sectPr.*?</w:sectPr>", entries["word/document.xml"].decode("utf-8"), re.S
+            ).group(0)
+            rels_xml = entries["word/_rels/document.xml.rels"].decode("utf-8")
+            content_types = entries["[Content_Types].xml"].decode("utf-8")
+            offset = {}
+            for match in re.finditer(r"<w:(header|footer)Reference[^>]*/>", sect):
+                element = match.group(0)
+                rid = re.search(r'r:id="(\w+)"', element).group(1)
+                target = re.search(
+                    r'Id="%s"[^>]*Target="([^"]+)"' % rid, rels_xml
+                ).group(1)
+                base = Path(target).stem
+                new_base = {
+                    "header1": "header7",
+                    "header2": "header9",
+                    "footer1": "footer7",
+                    "footer2": "footer9",
+                }[base]
+                offset["word/" + target] = "word/" + new_base + ".xml"
+                rels_xml = rels_xml.replace(
+                    'Target="%s"' % target, 'Target="%s"' % (new_base + ".xml")
+                )
+                content_types = content_types.replace(
+                    'PartName="/word/%s.xml"' % base, 'PartName="/word/%s.xml"' % new_base
+                )
+            for old_name, new_name in offset.items():
+                entries[new_name] = entries.pop(old_name)
+                rels_part = "word/_rels/%s.rels" % Path(old_name).name
+                if rels_part in entries:
+                    entries["word/_rels/%s.rels" % Path(new_name).name] = entries.pop(rels_part)
+            entries["word/_rels/document.xml.rels"] = rels_xml.encode("utf-8")
+            entries["[Content_Types].xml"] = content_types.encode("utf-8")
+            with zipfile.ZipFile(template, "w", zipfile.ZIP_DEFLATED) as archive:
+                for name, data in entries.items():
+                    archive.writestr(name, data)
+
+            source = self._write_md(tmp)
+            output = tmp / "out.docx"
+            self._convert(source, output, config, letterhead_file=str(template))
+            with zipfile.ZipFile(output) as archive:
+                parts = {name: archive.read(name) for name in archive.namelist()}
+            out_sect = re.search(
+                r"<w:sectPr.*?</w:sectPr>", parts["word/document.xml"].decode("utf-8"), re.S
+            ).group(0)
+            import letterhead as letterhead_module
+
+            out_refs = letterhead_module._sectpr_refs(out_sect, letterhead_module._doc_rels(parts))
+            first_text = parts[out_refs["header:first"]].decode("utf-8")
+            default_text = parts[out_refs["header:default"]].decode("utf-8")
+            self.assertIn("FIRST HEADER", first_text)
+            self.assertIn("DEFAULT HEADER", default_text)
+            self.assertIn("FIRST FOOTER", parts[out_refs["footer:first"]].decode("utf-8"))
+            self.assertIn("DEFAULT FOOTER", parts[out_refs["footer:default"]].decode("utf-8"))
+
+    def test_letterhead_keeps_body_paragraphs_identical(self):
+        config = md2word.get_preset("legal")
+        with TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            source = self._write_md(tmp)
+            plain = tmp / "plain.docx"
+            letterhead = tmp / "letterhead.docx"
+            self._convert(source, plain, config)
+            self._convert(source, letterhead, config, letterhead_file=str(self.LETTERHEAD))
+
+            def paragraphs(path):
+                with zipfile.ZipFile(path) as archive:
+                    document_xml = archive.read("word/document.xml").decode("utf-8")
+                return re.findall(r"<w:p\b.*?</w:p>", document_xml, re.S)
+
+            self.assertEqual(paragraphs(plain), paragraphs(letterhead))
+
+    def test_no_letterhead_keeps_page_number_footer_only(self):
+        config = md2word.get_preset("legal")
+        with TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            source = self._write_md(tmp)
+            output = tmp / "plain.docx"
+            stdout = self._convert(source, output, config, letterhead_file=None)
+            self.assertNotIn("已套用页眉页脚模板", stdout)
+
+            with zipfile.ZipFile(output) as archive:
+                document_xml = archive.read("word/document.xml").decode("utf-8")
+                self.assertNotIn("headerReference", document_xml)
+                self.assertNotIn("<w:titlePg", document_xml)
+                footers = sorted(
+                    name
+                    for name in archive.namelist()
+                    if re.match(r"word/footer\d*\.xml$", name)
+                )
+                self.assertEqual(footers, ["word/footer1.xml"])
+                footer = archive.read(footers[0]).decode("utf-8")
+                self.assertIn("PAGE", footer)
+                self.assertNotIn("地址：", footer)
+
+    def test_missing_letterhead_template_raises(self):
+        config = md2word.get_preset("legal")
+        with TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            source = self._write_md(tmp)
+            with self.assertRaises(FileNotFoundError):
+                self._convert(
+                    source,
+                    tmp / "out.docx",
+                    config,
+                    letterhead_file=str(tmp / "missing.docx"),
+                )
+
+    def test_letterhead_keeps_footnote_part(self):
+        config = md2word.get_preset("legal")
+        text = "# 标题\n\n正文[^1]。\n\n[^1]: 脚注内容。\n"
+        with TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            source = self._write_md(tmp, text)
+            output = tmp / "out.docx"
+            self._convert(source, output, config, letterhead_file=str(self.LETTERHEAD))
+            with zipfile.ZipFile(output) as archive:
+                document_xml = archive.read("word/document.xml").decode("utf-8")
+                self.assertIn("footnoteReference", document_xml)
+                self.assertIn("word/footnotes.xml", archive.namelist())
+                self.assertIn("<w:titlePg", document_xml)
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

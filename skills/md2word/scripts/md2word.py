@@ -29,6 +29,7 @@ from bs4 import BeautifulSoup
 
 # 导入配置模块
 from config import Config, load_config, get_preset, get_default_preset, list_presets, get_config, set_config
+from letterhead import apply_letterhead
 
 # 导入功能模块
 from formatter import (
@@ -607,6 +608,43 @@ def add_page_number(doc):
 # 工具函数
 # ============================================================================
 
+# 页眉页脚模板（letterhead）：默认资产与路径解析
+DEFAULT_LETTERHEAD_TEMPLATE = 'assets/letterhead/斯可睿抬头.docx'
+
+
+def resolve_letterhead_path(expr):
+    """把配置/命令行里的页眉页脚模板路径解析成绝对路径。
+
+    绝对路径原样返回；相对路径先按当前目录找，再按 skill 根目录找。
+    返回 None 表示显式关闭（空值或 none/off/false）。
+    """
+    if expr is None:
+        return None
+    expr = str(expr).strip()
+    if not expr or expr.lower() in ('none', 'off', 'false'):
+        return None
+    if os.path.isabs(expr):
+        return expr
+    if os.path.exists(expr):
+        return os.path.abspath(expr)
+    skill_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(skill_dir, expr)
+
+
+def resolve_letterhead_file(config, args):
+    """按命令行与配置决定本次转换用的页眉页脚模板（None 表示不用）。"""
+    if getattr(args, 'no_letterhead', False):
+        return None
+    expr = getattr(args, 'letterhead', None)
+    if expr == '__default__':
+        expr = config.get('letterhead.template') or DEFAULT_LETTERHEAD_TEMPLATE
+    if expr is None:
+        if not config.get('letterhead.enabled', False):
+            return None
+        expr = config.get('letterhead.template') or DEFAULT_LETTERHEAD_TEMPLATE
+    return resolve_letterhead_path(expr)
+
+
 def find_template_file(auto: bool = False):
     """查找 `assets/templates/` 下的 .docx 模板。
 
@@ -821,7 +859,7 @@ def add_book_header(section, title):
     r.font.size = Pt(9)
 
 
-def create_book(md_files, output_path, config, notes_mode='footnote'):
+def create_book(md_files, output_path, config, notes_mode='footnote', letterhead_file=None):
     """全书合并：多章 md → 单 docx。
     预处理：脚注 id 加章前缀防冲突；章间使用内部 marker 分隔。
     """
@@ -849,7 +887,8 @@ def create_book(md_files, output_path, config, notes_mode='footnote'):
     with open(tmp_md, 'w', encoding='utf-8') as fh:
         fh.write(full)
     try:
-        create_word_document(tmp_md, output_path, None, config, notes_mode, book_mode=True)
+        create_word_document(tmp_md, output_path, None, config, notes_mode, book_mode=True,
+                             letterhead_file=letterhead_file)
     finally:
         try:
             os.unlink(tmp_md)
@@ -861,7 +900,7 @@ def create_book(md_files, output_path, config, notes_mode='footnote'):
 # 核心转换流程
 # ============================================================================
 
-def create_word_document(md_file_path, output_path, template_file=None, config: Config = None, notes_mode='footnote', book_mode=False):
+def create_word_document(md_file_path, output_path, template_file=None, config: Config = None, notes_mode='footnote', book_mode=False, letterhead_file=None):
     """从Markdown文件创建格式化的Word文档"""
     if config is None:
         config = get_config()
@@ -889,31 +928,13 @@ def create_word_document(md_file_path, output_path, template_file=None, config: 
         # 获取body元素
         body = doc._element.body
 
-        # 记住sectPr：优先取 body 直挂的节属性；部分模板（如律所模板）把唯一 sectPr
-        # 放在末段落的 pPr 内，此时直接 find 会取不到，清空后文档将失去页面设置，
-        # 导致 doc.sections 为空并在后续 add_table 时抛 IndexError。
+        # 记住sectPr的位置和内容
         sectPr = body.find(qn('w:sectPr'))
-        nested_sectPr = None
-        if sectPr is None:
-            for p in body.iter(qn('w:p')):
-                pPr = p.find(qn('w:pPr'))
-                if pPr is not None:
-                    candidate = pPr.find(qn('w:sectPr'))
-                    if candidate is not None:
-                        nested_sectPr = candidate
-                        break
 
         # 移除body中的所有子元素（除了sectPr）
         for child in list(body):
             if child.tag != qn('w:sectPr'):
                 body.remove(child)
-
-        # 嵌套写法：将 sectPr 提升为 body 级，保留页面设置与页眉页脚引用
-        if nested_sectPr is not None:
-            parent = nested_sectPr.getparent()
-            if parent is not None:
-                parent.remove(nested_sectPr)
-            body.append(nested_sectPr)
 
         use_template_headers = True
         print("✅ 已清空模板内容，保留页眉页脚")
@@ -927,6 +948,12 @@ def create_word_document(md_file_path, output_path, template_file=None, config: 
         template_media_files = []
         template_sectPr_refs = []
         template_doc_rels = {}
+
+    if letterhead_file and use_template_headers:
+        print("⚠️  已使用整份模板（--template），忽略页眉页脚模板")
+        letterhead_file = None
+    if letterhead_file and not os.path.exists(letterhead_file):
+        raise FileNotFoundError(f"页眉页脚模板不存在: {letterhead_file}")
 
     # 设置默认字体
     try:
@@ -1287,8 +1314,8 @@ def create_word_document(md_file_path, output_path, template_file=None, config: 
     # endnote 模式：文档末追加“注释”小节
     fn_manager.append_endnotes_section(doc)
 
-    # 添加页码（仅在没有模板时）
-    if not use_template_headers:
+    # 添加页码（没有模板页眉页脚时；页眉页脚模板自带页码域）
+    if not use_template_headers and not letterhead_file:
         add_page_number(doc)
 
     # footnote + book 模式：每章脚注从 1 重置编号（per-section numRestart=eachSec）
@@ -1301,6 +1328,13 @@ def create_word_document(md_file_path, output_path, template_file=None, config: 
         enable_update_fields(doc)
         print('🔄 已设置打开时自动更新域（目录/页码免手动 F9）')
 
+    # 页眉页脚模板：开启首页差异化，并确保 first/default 部件存在（保存后注入模板内容）
+    if letterhead_file:
+        for section in doc.sections:
+            section.different_first_page_header_footer = True
+            for hf in (section.header, section.first_page_header, section.footer, section.first_page_footer):
+                hf.is_linked_to_previous = False
+
     # 保存文档
     doc.save(output_path)
 
@@ -1311,6 +1345,11 @@ def create_word_document(md_file_path, output_path, template_file=None, config: 
     _active_fn_manager = None
 
     print(f"✅ Word文档已生成: {output_path}")
+
+    # 页眉页脚模板：把模板的页眉/页脚部件搬到产物上（正文排版不受影响）
+    if letterhead_file:
+        apply_letterhead(output_path, letterhead_file)
+        print(f"✅ 已套用页眉页脚模板: {os.path.basename(letterhead_file)}")
 
 
 # ============================================================================
@@ -1340,6 +1379,9 @@ def main():
     parser.add_argument('--template', '-t', help='Word模板文件路径')
     parser.add_argument('--auto-template', action='store_true',
                         help='自动从 assets/templates/ 加载第一个 .docx 模板（默认关闭，避免律所 logo 等视觉元素出现在用户没显式要求的 docx 里）')
+    parser.add_argument('--letterhead', nargs='?', const='__default__', metavar='DOCX',
+                        help='只套用该 Word 模板的页眉页脚（保留首页/后续页差异），正文排版仍按当前配置；不带值时用预设里的默认模板')
+    parser.add_argument('--no-letterhead', action='store_true', help='关闭页眉页脚模板（覆盖预设默认）')
     parser.add_argument('--landscape', action='store_true', help='使用横向页面（Landscape）')
     parser.add_argument('--notes', choices=['footnote', 'endnote'], default='footnote',
                         help='脚注模式：footnote=页面脚注(默认)；endnote=文档末尾注(上标编号+末尾列表)')
@@ -1381,14 +1423,15 @@ def main():
         config = get_default_preset()
     
     set_config(config)
+    letterhead_file = resolve_letterhead_file(config, args)
 
     if args.book:
         output_file = args.out_file or 'book.docx'
-        create_book(args.book, output_file, config, args.notes)
+        create_book(args.book, output_file, config, args.notes, letterhead_file=letterhead_file)
         return
 
     if not args.input:
-        auto_mode(config)
+        auto_mode(config, letterhead_file)
         return
     
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -1414,7 +1457,8 @@ def main():
         config._config['page']['orientation'] = 'landscape'
 
     try:
-        create_word_document(md_file, output_file, template_file, config, args.notes)
+        create_word_document(md_file, output_file, template_file, config, args.notes,
+                             letterhead_file=letterhead_file)
         print_success_info(output_file, config)
     except Exception as e:
         print(f"❌ 错误: {e}")
@@ -1422,7 +1466,7 @@ def main():
         traceback.print_exc()
 
 
-def auto_mode(config: Config):
+def auto_mode(config: Config, letterhead_file=None):
     """自动模式：处理当前目录下的所有.md文件"""
     md_files = find_md_files()
     
@@ -1453,7 +1497,8 @@ def auto_mode(config: Config):
     for md_file in md_files:
         output_file = generate_output_filename(md_file)
         try:
-            create_word_document(md_file, output_file, template_file, config)
+            create_word_document(md_file, output_file, template_file, config,
+                                 letterhead_file=letterhead_file)
             success_count += 1
         except Exception as e:
             print(f"❌ 处理 {md_file} 时出错: {e}")
@@ -1502,3 +1547,5 @@ def print_success_info(filename=None, config: Config = None):
 
 if __name__ == "__main__":
     main()
+
+
